@@ -9,9 +9,11 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Allows you to propagate predefined request-scoped fields, usually but not always HTTP headers.
@@ -26,6 +28,9 @@ import java.util.Map;
  *
  * // later, you can tag that request ID or use it in log correlation
  * requestId = ExtraFieldPropagation.current("x-vcap-request-id");
+ *
+ * // You can also set or override the value similarly, which might be needed if a new request
+ * ExtraFieldPropagation.current("x-country-code", "FO");
  * }</pre>
  *
  * <p>You may also need to propagate a trace context you aren't using. For example, you may be in an
@@ -46,17 +51,26 @@ public final class ExtraFieldPropagation<K> implements Propagation<K> {
   }
 
   /** Wraps an underlying propagation implementation, pushing one or more fields */
-  public static Propagation.Factory newFactory(Propagation.Factory delegate, Collection<String> names) {
+  public static Propagation.Factory newFactory(Propagation.Factory delegate,
+      Collection<String> names) {
     return new Factory(delegate, names);
   }
 
   /** Returns the value of the field with the specified key or null if not available */
   @Nullable public static String current(String name) {
+    TraceContext context = currentTraceContext();
+    return context != null ? get(context, name) : null;
+  }
+
+  /** Sets the current value of the field with the specified key */
+  @Nullable public static void current(String name, String value) {
+    TraceContext context = currentTraceContext();
+    if (context != null) set(context, name, value);
+  }
+
+  @Nullable static TraceContext currentTraceContext() {
     Tracing tracing = Tracing.current();
-    if (tracing == null) return null;
-    TraceContext context = tracing.currentTraceContext().get();
-    if (context == null) return null;
-    return get(context, name);
+    return tracing != null ? tracing.currentTraceContext().get() : null;
   }
 
   /** Returns the value of the field with the specified key or null if not available */
@@ -68,6 +82,20 @@ public final class ExtraFieldPropagation<K> implements Propagation<K> {
       if (extra instanceof Extra) return ((Extra) extra).get(name);
     }
     return null;
+  }
+
+  /** Returns the value of the field with the specified key or null if not available */
+  @Nullable public static void set(TraceContext context, String name, String value) {
+    if (context == null) throw new NullPointerException("context == null");
+    if (name == null) throw new NullPointerException("name == null");
+    name = name.toLowerCase(Locale.ROOT); // since not all propagation handle mixed case
+    if (value == null) throw new NullPointerException("value == null");
+    for (Object extra : context.extra()) {
+      if (extra instanceof Extra) {
+        ((Extra) extra).set(name, value);
+        return;
+      }
+    }
   }
 
   static final class Factory extends Propagation.Factory {
@@ -100,6 +128,16 @@ public final class ExtraFieldPropagation<K> implements Propagation<K> {
       }
       return new ExtraFieldPropagation<>(delegate.create(keyFactory), names);
     }
+
+    @Override public TraceContext decorate(TraceContext context) {
+      TraceContext result = delegate.decorate(context);
+      for (Object extra : result.extra()) {
+        if (extra instanceof Extra) return result;
+      }
+      List<Object> extra = new ArrayList<>(result.extra());
+      extra.add(new Extra());
+      return result.toBuilder().extra(Collections.unmodifiableList(extra)).build();
+    }
   }
 
   final Propagation<K> delegate;
@@ -127,50 +165,29 @@ public final class ExtraFieldPropagation<K> implements Propagation<K> {
     return new ExtraFieldExtractor<>(extractorDelegate, getter, nameToKey);
   }
 
-  static abstract class Extra { // internal marker type
-    abstract void put(String field, String value);
-
-    abstract String get(String field);
-
-    abstract <C, K> void setAll(C carrier, Setter<C, K> setter, Map<String, K> nameToKey);
-  }
-
-  static final class One extends Extra {
-    String name, value;
-
-    @Override void put(String name, String value) {
-      this.name = name;
-      this.value = value;
-    }
-
-    @Override String get(String name) {
-      return name.equals(this.name) ? value : null;
-    }
-
-    @Override <C, K> void setAll(C carrier, Setter<C, K> setter, Map<String, K> nameToKey) {
-      K key = nameToKey.get(name);
-      if (key == null) return;
-      setter.put(carrier, key, value);
-    }
-
-    @Override public String toString() {
-      return "ExtraFieldPropagation{" + name + "=" + value + "}";
-    }
-  }
-
-  static final class Many extends Extra {
+  static final class Extra {
     final LinkedHashMap<String, String> fields = new LinkedHashMap<>();
 
-    @Override void put(String name, String value) {
-      fields.put(name, value);
+    void set(String name, String value) {
+      synchronized (fields) {
+        fields.put(name, value);
+      }
     }
 
-    @Override String get(String name) {
-      return fields.get(name);
+    String get(String name) {
+      final String result;
+      synchronized (fields) {
+        result = fields.get(name);
+      }
+      return result;
     }
 
-    @Override <C, K> void setAll(C carrier, Setter<C, K> setter, Map<String, K> nameToKey) {
-      for (Map.Entry<String, String> field : fields.entrySet()) {
+    <C, K> void setAll(C carrier, Setter<C, K> setter, Map<String, K> nameToKey) {
+      final Set<Map.Entry<String, String>> entrySet;
+      synchronized (fields) {
+        entrySet = new LinkedHashSet<>(fields.entrySet());
+      }
+      for (Map.Entry<String, String> field : entrySet) {
         K key = nameToKey.get(field.getKey());
         if (key == null) continue;
         setter.put(carrier, nameToKey.get(field.getKey()), field.getValue());
@@ -218,20 +235,12 @@ public final class ExtraFieldPropagation<K> implements Propagation<K> {
     @Override public TraceContextOrSamplingFlags extract(C carrier) {
       TraceContextOrSamplingFlags result = delegate.extract(carrier);
 
-      Extra extra = null;
+      Extra extra = new Extra(); // always allocate in case fields are added late
       for (Map.Entry<String, K> field : names.entrySet()) {
         String maybeValue = getter.get(carrier, field.getValue());
         if (maybeValue == null) continue;
-        if (extra == null) {
-          extra = new One();
-        } else if (extra instanceof One) {
-          One one = (One) extra;
-          extra = new Many();
-          extra.put(one.name, one.value);
-        }
-        extra.put(field.getKey(), maybeValue);
+        extra.set(field.getKey(), maybeValue);
       }
-      if (extra == null) return result;
       return result.toBuilder().addExtra(extra).build();
     }
   }

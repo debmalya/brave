@@ -1,6 +1,7 @@
 package brave.http;
 
 import brave.SpanCustomizer;
+import brave.propagation.ExtraFieldPropagation;
 import brave.sampler.Sampler;
 import java.io.IOException;
 import java.util.Map;
@@ -49,6 +50,49 @@ public abstract class ITHttpServer extends ITHttp {
       assertThat(s.parentId()).isEqualTo(parentId);
       assertThat(s.id()).isEqualTo(spanId);
     });
+  }
+
+  @Test
+  public void readsExtra_newTrace() throws Exception {
+    readsExtra(new Request.Builder());
+  }
+
+  @Test
+  public void readsExtra_unsampled() throws Exception {
+    readsExtra(new Request.Builder()
+        .header("X-B3-Sampled", "0"));
+
+    assertThat(spans).isEmpty();
+  }
+
+  @Test
+  public void readsExtra_existingTrace() throws Exception {
+    String traceId = "463ac35c9f6413ad";
+
+    readsExtra(new Request.Builder()
+        .header("X-B3-TraceId", traceId)
+        .header("X-B3-SpanId", traceId));
+
+    assertThat(spans).allSatisfy(s -> {
+      assertThat(s.traceId()).isEqualTo(traceId);
+      assertThat(s.id()).isEqualTo(traceId);
+    });
+  }
+
+  /**
+   * The /extra endpoint should copy the key {@link #EXTRA_KEY} to the response body using
+   * {@link ExtraFieldPropagation#current(String)}.
+   */
+  void readsExtra(Request.Builder builder) throws IOException {
+    Request request = builder.url(url("/extra"))
+        // this is the pre-configured key we can pass through
+        .header(EXTRA_KEY, "joey").build();
+
+    Response response = get(request);
+    assertThat(response.isSuccessful()).isTrue();
+    // if we can read the response header, the server must have been able to copy it
+    assertThat(response.body().source().readUtf8())
+        .isEqualTo("joey");
   }
 
   @Test
@@ -227,7 +271,8 @@ public abstract class ITHttpServer extends ITHttp {
       if (response.code() == 404) {
         throw new AssumptionViolatedException(request.url().encodedPath() + " not supported");
       }
-      return response;
+      // buffer the body so that it isn't tossed on finally. This allows assertions on the body
+      return response.newBuilder().body(response.peekBody(255)).build();
     }
   }
 
