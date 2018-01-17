@@ -4,6 +4,8 @@ import brave.SpanCustomizer;
 import brave.Tracer;
 import brave.Tracer.SpanInScope;
 import brave.internal.HexCodec;
+import brave.propagation.ExtraFieldPropagation;
+import brave.propagation.SamplingFlags;
 import brave.sampler.Sampler;
 import java.util.concurrent.TimeUnit;
 import okhttp3.mockwebserver.MockResponse;
@@ -68,6 +70,38 @@ public abstract class ITHttpClient<C> extends ITHttp {
         .isEqualTo(parent.context().traceIdString());
     assertThat(request.getHeader("x-b3-parentspanid"))
         .isEqualTo(HexCodec.toLowerHex(parent.context().spanId()));
+  }
+
+  @Test public void propagatesExtra_newTrace() throws Exception {
+    Tracer tracer = httpTracing.tracing().tracer();
+    server.enqueue(new MockResponse());
+
+    brave.Span parent = tracer.newTrace().name("test").start();
+    try (SpanInScope ws = tracer.withSpanInScope(parent)) {
+      ExtraFieldPropagation.set(parent.context(), EXTRA_KEY, "joey");
+      get(client, "/foo");
+    } finally {
+      parent.finish();
+    }
+
+    assertThat(server.takeRequest().getHeader(EXTRA_KEY))
+        .isEqualTo("joey");
+  }
+
+  @Test public void propagatesExtra_unsampledTrace() throws Exception {
+    Tracer tracer = httpTracing.tracing().tracer();
+    server.enqueue(new MockResponse());
+
+    brave.Span parent = tracer.newTrace(SamplingFlags.NOT_SAMPLED).name("test").start();
+    try (SpanInScope ws = tracer.withSpanInScope(parent)) {
+      ExtraFieldPropagation.set(parent.context(), EXTRA_KEY, "joey");
+      get(client, "/foo");
+    } finally {
+      parent.finish();
+    }
+
+    assertThat(server.takeRequest().getHeader(EXTRA_KEY))
+        .isEqualTo("joey");
   }
 
   /**

@@ -8,6 +8,7 @@ import java.util.Map;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
+import okhttp3.internal.http.HttpHeaders;
 import org.junit.AssumptionViolatedException;
 import org.junit.Before;
 import org.junit.Test;
@@ -105,7 +106,6 @@ public abstract class ITHttpServer extends ITHttp {
     assertThat(spans)
         .isEmpty();
   }
-
 
   @Test public void customSampler() throws Exception {
     String path = "/foo";
@@ -271,8 +271,9 @@ public abstract class ITHttpServer extends ITHttp {
       if (response.code() == 404) {
         throw new AssumptionViolatedException(request.url().encodedPath() + " not supported");
       }
-      // buffer the body so that it isn't tossed on finally. This allows assertions on the body
-      return response.newBuilder().body(response.peekBody(255)).build();
+      if (!HttpHeaders.hasBody(response) || response.code() == 500) return response;
+      // buffer success response so tests can read it. Otherwise the finally block will drop it
+      return response.newBuilder().body(response.peekBody(Long.MAX_VALUE)).build();
     }
   }
 
